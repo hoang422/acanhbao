@@ -1,170 +1,121 @@
-import React, { useState, useEffect, useRef, useCallback, useMemo } from 'react';
-import { View, Text, Button, Alert, StyleSheet, FlatList, ActivityIndicator } from 'react-native';
-import { Camera, useCameraDevices, useFrameProcessor } from 'react-native-vision-camera';
-import { runOnJS } from 'react-native-reanimated';
+import React, { useState, useEffect, useCallback, useMemo } from 'react';
+import { View, Text, Button, Alert, StyleSheet, FlatList, ActivityIndicator, TouchableOpacity } from 'react-native';
+import { Camera, useCameraDevice, useCameraPermission } from 'react-native-vision-camera';
+import { useScanBarcodes, BarcodeFormat } from 'vision-camera-code-scanner';
+import { Audio } from 'expo-av';
 import AsyncStorage from '@react-native-async-storage/async-storage';
 import axios from 'axios';
-import Sound from 'react-native-sound';
-import { BarcodeFormat, scanBarcodes } from 'vision-camera-code-scanner';
+import * as Sharing from 'expo-sharing';
 
 const API_URL = 'https://your-server-url.com/api/qr';
-const MAX_HISTORY_ITEMS = 50; // Tăng giới hạn lịch sử lên 50 mục
+const MAX_HISTORY_ITEMS = 50;
 
 const App = () => {
   const [scanning, setScanning] = useState(false);
   const [history, setHistory] = useState([]);
   const [loading, setLoading] = useState(true);
-  const [hasPermission, setHasPermission] = useState(null);
-  const devices = useCameraDevices();
-  const device = devices.back;
-  const beepSoundRef = useRef(null);
+  const [sound, setSound] = useState(null);
+  const { hasPermission, requestPermission } = useCameraPermission();
+  const device = useCameraDevice('back');
+  
+  const [frameProcessor, barcodes] = useScanBarcodes([BarcodeFormat.QR_CODE], {
+    checkInverted: true,
+  });
 
-  // Sử dụng useMemo để tránh tính toán lại không cần thiết
   const historyEmpty = useMemo(() => history.length === 0, [history]);
 
   useEffect(() => {
     const initializeApp = async () => {
-      try {
-        beepSoundRef.current = new Sound('beep.mp3', Sound.MAIN_BUNDLE, (error) => {
-          if (error) console.log('Lỗi tải âm thanh:', error);
-        });
+      const { sound } = await Audio.Sound.createAsync(require('./assets/beep.mp3'));
+      setSound(sound);
 
-        const cameraPermission = await Camera.requestCameraPermission();
-        setHasPermission(cameraPermission === 'authorized');
-
-        await loadHistory();
-      } catch (error) {
-        console.error('Lỗi khởi tạo:', error);
-      } finally {
-        setLoading(false);
+      if (!hasPermission) {
+        await requestPermission();
       }
+
+      await loadHistory();
+      setLoading(false);
     };
 
     initializeApp();
 
-    return () => {
-      beepSoundRef.current?.release();
-    };
-  }, []);
+    return () => sound?.unloadAsync();
+  }, [hasPermission]);
+
+  const playBeep = async () => {
+    try {
+      await sound?.replayAsync();
+    } catch (error) {
+      console.error('Lỗi phát âm thanh:', error);
+    }
+  };
+
+  useEffect(() => {
+    if (barcodes.length > 0 && !scanning) {
+      handleBarCodeScanned(barcodes[0].displayValue);
+    }
+  }, [barcodes]);
 
   const loadHistory = async () => {
     try {
       const storedHistory = await AsyncStorage.getItem('qrHistory');
-      if (storedHistory) {
-        const parsedHistory = JSON.parse(storedHistory);
-        // Đảm bảo không vượt quá giới hạn khi tải từ storage
-        setHistory(parsedHistory.slice(0, MAX_HISTORY_ITEMS));
-      }
+      if (storedHistory) setHistory(JSON.parse(storedHistory).slice(0, MAX_HISTORY_ITEMS));
     } catch (error) {
       console.error('Lỗi tải lịch sử:', error);
-      Alert.alert('Lỗi', 'Không thể tải lịch sử quét');
     }
   };
 
   const saveHistory = async (newEntry) => {
-    try {
-      // Chỉ giữ lại MAX_HISTORY_ITEMS mục gần nhất
-      const updatedHistory = [newEntry, ...history].slice(0, MAX_HISTORY_ITEMS);
-      await AsyncStorage.setItem('qrHistory', JSON.stringify(updatedHistory));
-      setHistory(updatedHistory);
-    } catch (error) {
-      console.error('Lỗi lưu lịch sử:', error);
-    }
+    const updatedHistory = [newEntry, ...history].slice(0, MAX_HISTORY_ITEMS);
+    await AsyncStorage.setItem('qrHistory', JSON.stringify(updatedHistory));
+    setHistory(updatedHistory);
   };
 
   const handleBarCodeScanned = useCallback(async (data) => {
-    if (scanning) return;
     setScanning(true);
+    await playBeep();
 
-    try {
-      beepSoundRef.current?.play();
+    const newEntry = { 
+      id: Date.now().toString(), 
+      data, 
+      timestamp: new Date().toLocaleString() 
+    };
+    
+    await saveHistory(newEntry);
 
-      const newEntry = { 
-        id: Date.now().toString(), 
-        data, 
-        timestamp: new Date().toLocaleString() 
-      };
-      
-      await saveHistory(newEntry);
-
-      let attempts = 0;
-      const maxAttempts = 3;
-      
-      while (attempts < maxAttempts) {
-        try {
-          await axios.post(API_URL, newEntry);
-          Alert.alert('Thành công', 'Quét mã QR thành công!');
-          break;
-        } catch (error) {
-          attempts++;
-          if (attempts === maxAttempts) {
-            Alert.alert('Cảnh báo', 'Quét thành công nhưng không gửi được lên server');
-          }
+    let attempts = 0;
+    while (attempts < 3) {
+      try {
+        await axios.post(API_URL, newEntry);
+        Alert.alert('Thành công', 'Quét mã QR thành công!');
+        break;
+      } catch (error) {
+        if (++attempts === 3) {
+          Alert.alert('Cảnh báo', 'Quét thành công nhưng không gửi được lên server');
         }
       }
-    } catch (error) {
-      console.error('Lỗi quét:', error);
-      Alert.alert('Lỗi', 'Không thể xử lý mã QR');
-    } finally {
-      setTimeout(() => setScanning(false), 2000);
     }
-  }, [scanning, history]);
-
-  const frameProcessor = useFrameProcessor((frame) => {
-    'worklet';
-    const barcodes = scanBarcodes(frame, [BarcodeFormat.QR_CODE], { checkInverted: true });
-    if (barcodes.length > 0) {
-      runOnJS(handleBarCodeScanned)(barcodes[0].displayValue);
-    }
-  }, [handleBarCodeScanned]);
+    setTimeout(() => setScanning(false), 2000);
+  }, [history]);
 
   const clearHistory = async () => {
-    try {
-      await AsyncStorage.removeItem('qrHistory');
-      setHistory([]);
-    } catch (error) {
-      console.error('Lỗi xóa lịch sử:', error);
-      Alert.alert('Lỗi', 'Không thể xóa lịch sử');
-    }
+    await AsyncStorage.removeItem('qrHistory');
+    setHistory([]);
   };
 
-  // Tối ưu hiển thị lịch sử với getItemLayout
-  const getItemLayout = useCallback((data, index) => ({
-    length: 60, // Chiều cao cố định của mỗi item
-    offset: 60 * index,
-    index,
-  }), []);
+  const shareHistory = async () => {
+    const historyText = history.map(item => `${item.timestamp}: ${item.data}`).join('\n\n');
+    await Sharing.shareAsync(historyText);
+  };
 
-  if (loading) {
-    return (
-      <View style={[styles.container, styles.center]}>
-        <ActivityIndicator size="large" />
-      </View>
-    );
-  }
-
-  if (hasPermission === false) {
-    return (
-      <View style={[styles.container, styles.center]}>
-        <Text>Không có quyền truy cập camera</Text>
-        <Button 
-          title="Yêu cầu quyền" 
-          onPress={async () => {
-            const permission = await Camera.requestCameraPermission();
-            setHasPermission(permission === 'authorized');
-          }} 
-        />
-      </View>
-    );
-  }
-
-  if (!device) {
-    return (
-      <View style={[styles.container, styles.center]}>
-        <Text>Camera không khả dụng</Text>
-      </View>
-    );
-  }
+  if (loading) return <View style={styles.center}><ActivityIndicator size="large" /></View>;
+  if (!hasPermission) return (
+    <View style={styles.center}>
+      <Text>Không có quyền truy cập camera</Text>
+      <Button title="Yêu cầu quyền" onPress={requestPermission} />
+    </View>
+  );
+  if (!device) return <View style={styles.center}><Text>Camera không khả dụng</Text></View>;
 
   return (
     <View style={styles.container}>
@@ -175,18 +126,21 @@ const App = () => {
         frameProcessor={frameProcessor}
         frameProcessorFps={5}
       />
+      
+      <View style={styles.scanOverlay}>
+        <View style={styles.scanFrame} />
+      </View>
+      
       <View style={styles.overlay}>
         <Text style={styles.text}>Quét mã QR</Text>
-        <Button 
-          title="Xóa lịch sử" 
-          onPress={clearHistory} 
-          disabled={historyEmpty}
-        />
+        <View style={styles.buttonGroup}>
+          <Button title="Xóa lịch sử" onPress={clearHistory} disabled={historyEmpty} />
+          <Button title="Chia sẻ" onPress={shareHistory} disabled={historyEmpty} />
+        </View>
       </View>
+      
       <View style={styles.historyContainer}>
-        <Text style={styles.historyTitle}>
-          Lịch sử quét ({history.length}/{MAX_HISTORY_ITEMS}):
-        </Text>
+        <Text style={styles.historyTitle}>Lịch sử quét ({history.length}/{MAX_HISTORY_ITEMS}):</Text>
         {historyEmpty ? (
           <Text style={styles.noData}>Chưa có lịch sử quét</Text>
         ) : (
@@ -194,14 +148,11 @@ const App = () => {
             data={history}
             keyExtractor={(item) => item.id}
             renderItem={({ item }) => (
-              <View style={styles.historyItem}>
-                <Text style={styles.qrText} numberOfLines={1} ellipsizeMode="tail">
-                  {item.data}
-                </Text>
+              <TouchableOpacity style={styles.historyItem} onPress={() => Alert.alert('Nội dung', item.data)}>
+                <Text style={styles.qrText} numberOfLines={1} ellipsizeMode="tail">{item.data}</Text>
                 <Text style={styles.timestamp}>{item.timestamp}</Text>
-              </View>
+              </TouchableOpacity>
             )}
-            getItemLayout={getItemLayout}
             initialNumToRender={10}
             maxToRenderPerBatch={10}
             windowSize={11}
@@ -214,30 +165,75 @@ const App = () => {
 
 const styles = StyleSheet.create({
   container: { flex: 1 },
-  center: { justifyContent: 'center', alignItems: 'center' },
+  center: { 
+    flex: 1, 
+    justifyContent: 'center', 
+    alignItems: 'center' 
+  },
   camera: { flex: 1 },
+  scanOverlay: {
+    position: 'absolute',
+    top: 0,
+    left: 0,
+    right: 0,
+    bottom: 0,
+    justifyContent: 'center',
+    alignItems: 'center',
+    backgroundColor: 'rgba(0,0,0,0.4)',
+  },
+  scanFrame: {
+    width: 250,
+    height: 250,
+    borderWidth: 2,
+    borderColor: 'white',
+    backgroundColor: 'rgba(255,255,255,0.1)',
+  },
   overlay: {
     position: 'absolute',
     top: 50,
     left: 20,
     right: 20,
     alignItems: 'center',
-    backgroundColor: 'rgba(0,0,0,0.5)',
-    padding: 10,
-    borderRadius: 10,
   },
-  text: { color: 'white', fontSize: 18, marginBottom: 10 },
-  historyContainer: { flex: 1, padding: 10, backgroundColor: '#fff' },
-  historyTitle: { fontSize: 18, fontWeight: 'bold', marginBottom: 10 },
-  noData: { fontSize: 16, color: 'gray', textAlign: 'center', marginTop: 20 },
+  buttonGroup: {
+    flexDirection: 'row',
+    justifyContent: 'space-between',
+    width: '100%',
+    marginTop: 10,
+  },
+  historyContainer: { 
+    flex: 1, 
+    padding: 10, 
+    backgroundColor: '#fff' 
+  },
+  historyTitle: { 
+    fontSize: 18, 
+    fontWeight: 'bold', 
+    marginBottom: 10 
+  },
+  noData: { 
+    fontSize: 16, 
+    color: 'gray', 
+    textAlign: 'center', 
+    marginTop: 20 
+  },
   historyItem: { 
-    height: 60, // Chiều cao cố định
+    height: 60,
     padding: 10, 
     borderBottomWidth: 1, 
     borderBottomColor: '#ddd',
   },
   qrText: { fontSize: 14 },
-  timestamp: { fontSize: 12, color: 'gray', marginTop: 5 },
+  timestamp: { 
+    fontSize: 12, 
+    color: 'gray', 
+    marginTop: 5 
+  },
+  text: { 
+    color: 'white', 
+    fontSize: 18, 
+    marginBottom: 10 
+  }
 });
 
 export default App;
